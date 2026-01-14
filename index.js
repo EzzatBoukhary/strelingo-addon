@@ -7,6 +7,7 @@ const { addonBuilder } = require('stremio-addon-sdk');
 const axios = require('axios');
 const { Buffer } = require('buffer');
 const pako = require('pako');
+const AdmZip = require('adm-zip');
 const { put } = require('@vercel/blob');
 const { createClient } = require('@supabase/supabase-js');
 const { convert: convertWithSubtitleConverter } = require('subtitle-converter');
@@ -96,15 +97,16 @@ const ADDON_PORT = process.env.PORT || 7000;
 const LOCAL_STORAGE_DIR = process.env.LOCAL_STORAGE_DIR; // If set, enables local file storage
 const EXTERNAL_URL = process.env.EXTERNAL_URL || `http://localhost:${ADDON_PORT}`; // External URL for subtitle access
 const ADDON_NAME = process.env.ADDON_NAME || 'Strelingo - Dual Language Subtitles'; // Custom addon name for self-hosted instances
+const SUBDL_API_KEY = process.env.SUBDL_API_KEY; // SubDL API key (get from https://subdl.com)
 
 // Rate limiting fully removed
 
 // Create a new addon builder
 const builder = new addonBuilder({
     id: 'com.serhat.strelingo',
-    version: '0.1.2',
+    version: '0.2.0',
     name: ADDON_NAME,
-    description: 'Provides dual subtitles (main + translation) from OpenSubtitles for language learning. <br><a href="https://github.com/Serkali-sudo/strelingo-addon" style="color: #1E90FF;">GitHub</a>',
+    description: 'Provides dual subtitles (main + translation) from OpenSubtitles and SubDL for language learning. Creates all combinations for better sync options. <br><a href="https://github.com/Serkali-sudo/strelingo-addon" style="color: #1E90FF;">GitHub</a>',
     resources: ['subtitles'],
     // Request video hash/size/filename from Stremio for better subtitle matching
     subtitleExtra: ['videoHash', 'videoSize', 'filename'],
@@ -157,6 +159,201 @@ function parseLangCode(lang) {
 
 // (All previous queue/timer logic has been removed intentionally)
 
+// --- SubDL API Integration ---
+
+// Map our ISO 639-3 codes to SubDL's language codes where they differ
+const subDLLanguageMap = {
+    'eng': 'en',
+    'ara': 'ar',
+    'spa': 'es',
+    'fre': 'fr',
+    'ger': 'de',
+    'ita': 'it',
+    'por': 'pt',
+    'rus': 'ru',
+    'jpn': 'ja',
+    'kor': 'ko',
+    'chi': 'zh',
+    'zht': 'zh-tw',
+    'hin': 'hi',
+    'ben': 'bn',
+    'tel': 'te',
+    'mar': 'mr',
+    'tam': 'ta',
+    'tur': 'tr',
+    'pol': 'pl',
+    'ukr': 'uk',
+    'dut': 'nl',
+    'swe': 'sv',
+    'dan': 'da',
+    'nor': 'no',
+    'fin': 'fi',
+    'ell': 'el',
+    'tha': 'th',
+    'vie': 'vi',
+    'ind': 'id',
+    'heb': 'he',
+    'per': 'fa',
+    'cze': 'cs',
+    'rum': 'ro',
+    'hun': 'hu',
+    'hrv': 'hr',
+    'scc': 'sr',
+    'bul': 'bg',
+    'slo': 'sk',
+    'slv': 'sl',
+    'cat': 'ca'
+};
+
+// Convert our ISO 639-3 code to SubDL format
+function convertToSubDLLanguageCode(iso639_3) {
+    return subDLLanguageMap[iso639_3] || iso639_3;
+}
+
+// Fetch subtitles from SubDL API
+async function fetchSubtitlesFromSubDL(imdbId, type, season = null, episode = null) {
+    try {
+        console.log(`[SubDL] Fetching subtitles for IMDB ID: ${imdbId}, Type: ${type}`);
+        
+        // Build SubDL API URL
+        // SubDL uses imdb_id parameter (with tt prefix)
+        let apiUrl = `https://api.subdl.com/api/v1/subtitles`;
+        const params = new URLSearchParams();
+        params.append('api_key', SUBDL_API_KEY);
+        params.append('imdb_id', imdbId); // SubDL expects full IMDB ID with 'tt' prefix
+        
+        if (type === 'series' && season && episode) {
+            params.append('season_number', season);
+            params.append('episode_number', episode);
+        }
+        
+        apiUrl += '?' + params.toString();
+        console.log(`[SubDL] API URL: ${apiUrl}`);
+
+        const response = await axios.get(apiUrl, {
+            timeout: 10000,
+            headers: {
+                'User-Agent': 'Strelingo/1.0'
+            }
+        });
+
+        if (!response.data || !response.data.subtitles || !Array.isArray(response.data.subtitles)) {
+            console.log('[SubDL] No subtitles found or invalid response format');
+            return [];
+        }
+
+        const subtitles = response.data.subtitles;
+        console.log(`[SubDL] Found ${subtitles.length} subtitles`);
+
+        // Map SubDL response to our format
+        // SubDL returns: { language, url, release_name, ... }
+        // URL format: /subtitle/xxx-yyy.zip (relative, needs to be made absolute)
+        const mappedSubtitles = subtitles.map((sub, idx) => {
+            // Convert SubDL language code to our ISO 639-3 format
+            const subDLLang = (sub.language || sub.lang || 'EN').toUpperCase();
+            let ourLangCode = 'eng'; // Default
+            
+            // Map common SubDL language codes to our format
+            const langMap = {
+                'EN': 'eng', 'AR': 'ara', 'ES': 'spa', 'FR': 'fre', 'DE': 'ger',
+                'IT': 'ita', 'PT': 'por', 'RU': 'rus', 'JA': 'jpn', 'KO': 'kor',
+                'ZH': 'chi', 'HI': 'hin', 'TR': 'tur', 'PL': 'pol', 'UK': 'ukr',
+                'NL': 'dut', 'SV': 'swe', 'DA': 'dan', 'NO': 'nor', 'FI': 'fin',
+                'EL': 'ell', 'TH': 'tha', 'VI': 'vie', 'ID': 'ind', 'HE': 'heb',
+                'FA': 'per', 'CS': 'cze', 'RO': 'rum', 'HU': 'hun', 'HR': 'hrv',
+                'SR': 'scc', 'BG': 'bul', 'SK': 'slo', 'SL': 'slv', 'CA': 'cat'
+            };
+            
+            ourLangCode = langMap[subDLLang] || 'eng';
+            
+            // Make URL absolute - SubDL returns relative paths
+            let fullUrl = sub.url;
+            if (fullUrl && fullUrl.startsWith('/')) {
+                fullUrl = `https://dl.subdl.com${fullUrl}`;
+            }
+
+            return {
+                id: `subdl-${sub.sd_id || idx}`,
+                url: fullUrl,
+                lang: ourLangCode,
+                downloads: 1000 - idx, // SubDL doesn't provide download counts, use index-based priority
+                source: 'SubDL',
+                releaseName: sub.release_name || sub.name || 'SubDL',
+                author: sub.author || 'Unknown'
+            };
+        });
+
+        console.log(`[SubDL] Mapped ${mappedSubtitles.length} subtitles to internal format`);
+        return mappedSubtitles;
+
+    } catch (error) {
+        console.error('[SubDL] Error fetching subtitles:', error.message);
+        if (error.response) {
+            console.error('[SubDL] Response status:', error.response.status);
+            console.error('[SubDL] Response data:', JSON.stringify(error.response.data));
+        }
+        return [];
+    }
+}
+
+// Helper function to fetch and extract subtitle from SubDL ZIP
+async function fetchSubtitleContentFromSubDL(url, languageCode = null) {
+    console.log(`[SubDL] Fetching subtitle from ZIP: ${url}`);
+    try {
+        const response = await axios.get(url, {
+            responseType: 'arraybuffer',
+            timeout: 15000,
+            maxContentLength: 10 * 1024 * 1024,  // 10 MB limit
+            headers: {
+                'User-Agent': 'Strelingo/1.0'
+            }
+        });
+
+        const buffer = Buffer.from(response.data);
+        
+        // Use adm-zip to extract SRT file from ZIP
+        try {
+            const zip = new AdmZip(buffer);
+            const zipEntries = zip.getEntries();
+            
+            console.log(`[SubDL] ZIP contains ${zipEntries.length} file(s)`);
+            
+            // Find first .srt file
+            for (const entry of zipEntries) {
+                if (entry.entryName.toLowerCase().endsWith('.srt') && !entry.isDirectory) {
+                    console.log(`[SubDL] Found SRT file in ZIP: ${entry.entryName}`);
+                    
+                    // Extract file data
+                    const fileData = entry.getData();
+                    
+                    // Decode the subtitle content
+                    const subtitleText = await decodeSubtitleBuffer(fileData, languageCode);
+                    if (subtitleText) {
+                        console.log(`[SubDL] Successfully extracted and decoded SRT from ZIP (${fileData.length} bytes -> ${subtitleText.length} chars)`);
+                        return subtitleText;
+                    } else {
+                        console.warn(`[SubDL] Failed to decode SRT file: ${entry.entryName}`);
+                    }
+                }
+            }
+            
+            console.error(`[SubDL] No valid SRT file found in ZIP`);
+            return null;
+            
+        } catch (zipError) {
+            console.error(`[SubDL] Error processing ZIP file: ${zipError.message}`);
+            return null;
+        }
+
+    } catch (error) {
+        console.error(`[SubDL] Error fetching subtitle from ${url}:`, error.message);
+        if (error.response) {
+            console.error(`[SubDL] Status: ${error.response.status}`);
+        }
+        return null;
+    }
+}
+
 // --- Helper Function to Fetch All Subtitles ---
 async function fetchAllSubtitles(baseSearchParams, type, videoParams = {}, needsJapanese = false) {
     // Build the new API URL
@@ -205,6 +402,26 @@ async function fetchAllSubtitles(baseSearchParams, type, videoParams = {}, needs
         
         const promises = [opensubsResponse];
         
+        // Fetch from SubDL (only if API key is configured)
+        if (SUBDL_API_KEY) {
+            console.log(`Also fetching subtitles from SubDL...`);
+            const subDLResponse = fetchSubtitlesFromSubDL(
+                imdbId,
+                type,
+                baseSearchParams.season,
+                baseSearchParams.episode
+            ).then((subtitles) => {
+                return { subtitles }; // Wrap in object to match other sources
+            }).catch((err) => {
+                console.error(`[SubDL] Promise failed:`, err.message);
+                return { subtitles: [] };
+            });
+            
+            promises.push(subDLResponse);
+        } else {
+            console.log('[SubDL] Skipping - no API key configured (set SUBDL_API_KEY in .env)');
+        }
+        
         // Only fetch from Buta no Subs if one of the languages is Japanese
         if (needsJapanese) {
             const butaNoSubsUrl = `https://buta-no-subs-stremio-addon.onrender.com/subtitles/${type}/tt${baseSearchParams.imdbid}${(baseSearchParams.season) ? ":" + baseSearchParams.season + ":" + baseSearchParams.episode : ""}.json`;
@@ -221,7 +438,8 @@ async function fetchAllSubtitles(baseSearchParams, type, videoParams = {}, needs
                     id: sub.id,
                     url: sub.url,
                     lang: sub.lang || 'jpn',
-                    downloads: res.data.subtitles.length - idx // Preserve order
+                    downloads: res.data.subtitles.length - idx, // Preserve order
+                    source: 'ButaNoSubs'
                 }));
                 return { subtitles };
             }).catch(() => {
@@ -242,14 +460,26 @@ async function fetchAllSubtitles(baseSearchParams, type, videoParams = {}, needs
         
         let allSubtitles = [];
         
-        // Add OpenSubtitles results (all languages)
+        // Add OpenSubtitles results (all languages) - mark source
         if (results[0].status === 'fulfilled' && results[0].value.data && results[0].value.data.subtitles) {
-            allSubtitles = allSubtitles.concat(results[0].value.data.subtitles);
+            const opensubsSubtitles = results[0].value.data.subtitles.map(sub => ({
+                ...sub,
+                source: 'OpenSubtitles'
+            }));
+            allSubtitles = allSubtitles.concat(opensubsSubtitles);
+            console.log(`[OpenSubtitles] Added ${opensubsSubtitles.length} subtitles`);
         }
         
-        // Add Buta no Subs results (Japanese) if we requested it
-        if (needsJapanese && results[1] && results[1].status === 'fulfilled' && results[1].value.subtitles) {
+        // Add SubDL results (second promise)
+        if (results[1] && results[1].status === 'fulfilled' && results[1].value.subtitles) {
             allSubtitles = allSubtitles.concat(results[1].value.subtitles);
+            console.log(`[SubDL] Added ${results[1].value.subtitles.length} subtitles`);
+        }
+
+        // Add Buta no Subs results (Japanese) if we requested it (third promise)
+        if (needsJapanese && results[2] && results[2].status === 'fulfilled' && results[2].value.subtitles) {
+            allSubtitles = allSubtitles.concat(results[2].value.subtitles);
+            console.log(`[ButaNoSubs] Added ${results[2].value.subtitles.length} subtitles`);
         }
 
         if (allSubtitles.length === 0) {
@@ -282,12 +512,23 @@ function filterSubtitlesByLanguage(allSubtitles, languageId) {
         return null;
     }
 
-    // Sort by preferred language code order, then by downloads within each code
+    // Sort by source preference first (SubDL > OpenSubtitles > ButaNoSubs),
+    // then by language code preference, then by downloads within each group
+    const sourceOrder = { 'SubDL': 0, 'OpenSubtitles': 1, 'ButaNoSubs': 2 };
+    
     langSubs.sort((a, b) => {
+        // First, sort by source (SubDL prioritized)
+        const aSourceOrder = sourceOrder[a.source] !== undefined ? sourceOrder[a.source] : 99;
+        const bSourceOrder = sourceOrder[b.source] !== undefined ? sourceOrder[b.source] : 99;
+        
+        if (aSourceOrder !== bSourceOrder) {
+            return aSourceOrder - bSourceOrder;
+        }
+
+        // Within the same source, sort by language code preference (lower index = higher preference)
         const aCodeIndex = codesToMatch.indexOf(a.lang);
         const bCodeIndex = codesToMatch.indexOf(b.lang);
 
-        // First, sort by language code preference (lower index = higher preference)
         if (aCodeIndex !== bCodeIndex) {
             return aCodeIndex - bCodeIndex;
         }
@@ -306,13 +547,14 @@ function filterSubtitlesByLanguage(allSubtitles, languageId) {
             lang: sub.lang,
             format: 'srt', // Always SRT format
             langName: languageMap[sub.lang] || sub.lang,
-            releaseName: 'OpenSubtitles',
+            releaseName: sub.releaseName || sub.source || 'Unknown',
             rating: 0,
-            downloads: sub.downloads || (langSubs.length - idx) // Preserve order
+            downloads: sub.downloads || (langSubs.length - idx), // Preserve order
+            source: sub.source || 'Unknown' // Track source
         };
     });
 
-    console.log(`Found ${subtitleList.length} valid subtitles for ${languageId}.`);
+    console.log(`Found ${subtitleList.length} valid subtitles for ${languageId} from sources: ${[...new Set(subtitleList.map(s => s.source))].join(', ')}`);
     return subtitleList;
 }
 
@@ -962,19 +1204,38 @@ process.on('SIGINT', () => {
                     console.log('✅ Successfully fetched subtitles using OLD API fallback!');
                 }
                 
-                // 2. Find a valid main subtitle by trying each one from the sorted list
-                let mainParsed = null;
-                let selectedMainSubInfo = null;
+                // 2. Process multiple main and translation subtitle candidates
+                // Fetch and parse subtitles from different sources to ensure diversity
+                const mainCandidates = [];
+                const maxMainCandidates = 6;
+                const maxPerSource = 4; // Maximum from each source to ensure diversity
+                const mainSourceCounts = {};
+                
+                console.log(`Processing up to ${maxMainCandidates} main subtitle candidates (max ${maxPerSource} per source)...`);
                 for (const mainSubInfo of mainSubInfoList) {
-                    console.log(`Attempting to process main subtitle: ID=${mainSubInfo.id}, Downloads=${mainSubInfo.downloads}`);
+                    if (mainCandidates.length >= maxMainCandidates) break;
                     
-                    // Use old API fetch if format is not SRT (indicates old API source)
-                    // Pass the actual language code from API response (not user's requested code)
-                    // This ensures proper encoding detection even when user requested an alias
+                    // Track how many we've taken from this source
+                    const source = mainSubInfo.source || 'Unknown';
+                    mainSourceCounts[source] = (mainSourceCounts[source] || 0);
+                    
+                    // Skip if we already have enough from this source (unless we haven't hit our total limit)
+                    if (mainSourceCounts[source] >= maxPerSource && mainCandidates.length >= maxPerSource) {
+                        continue;
+                    }
+                    
+                    console.log(`Attempting to process main candidate ${mainCandidates.length + 1}: ID=${mainSubInfo.id}, Source=${mainSubInfo.source}, Downloads=${mainSubInfo.downloads}`);
+                    
+                    // Choose fetch method based on source
                     let mainSubContent;
-                    if (mainSubInfo.format && mainSubInfo.format.toLowerCase() !== 'srt') {
+                    if (mainSubInfo.source === 'SubDL') {
+                        // SubDL returns ZIP files
+                        mainSubContent = await fetchSubtitleContentFromSubDL(mainSubInfo.url, mainSubInfo.lang);
+                    } else if (mainSubInfo.format && mainSubInfo.format.toLowerCase() !== 'srt') {
+                        // Old API with non-SRT format
                         mainSubContent = await fetchSubtitleContentOldAPI(mainSubInfo.url, mainSubInfo.format, cookie, false, mainSubInfo.lang);
                     } else {
+                        // Standard SRT fetch
                         mainSubContent = await fetchSubtitleContent(mainSubInfo.url, mainSubInfo.format, mainSubInfo.lang);
                     }
                     if (!mainSubContent) {
@@ -990,170 +1251,224 @@ process.on('SIGINT', () => {
                     }
 
                     // Success!
-                    mainParsed = parsed;
-                    selectedMainSubInfo = mainSubInfo;
-                    console.log(`Successfully processed main subtitle (ID: ${selectedMainSubInfo.id}). Proceeding with translations.`);
-                    break; // Exit loop once a working main sub is found
+                    mainCandidates.push({
+                        parsed: parsed,
+                        info: mainSubInfo
+                    });
+                    mainSourceCounts[source]++;
+                    console.log(`Successfully processed main candidate ${mainCandidates.length} (ID: ${mainSubInfo.id}, Source: ${mainSubInfo.source})`);
                 }
 
-                if (!mainParsed) {
+                if (mainCandidates.length === 0) {
                     console.error("Failed to fetch and parse any of the available main subtitles. Cannot proceed.");
                     return { subtitles: [], cacheMaxAge: 60 };
                 }
 
-                // 3. Process translation candidates until we have 4 successful results
-                const finalSubtitles = [];
-                const usedTransUrls = new Set();
+                console.log(`Successfully processed ${mainCandidates.length} main subtitle candidates.`);
 
+                // 3. Process multiple translation candidates from different sources
+                const transCandidates = [];
+                const maxTransCandidates = 6;
+                const maxTransPerSource = 4; // Maximum from each source to ensure diversity
+                const usedTransUrls = new Set();
+                const transSourceCounts = {};
+
+                console.log(`Processing up to ${maxTransCandidates} translation subtitle candidates (max ${maxTransPerSource} per source)...`);
                 for (const transSubInfo of transSubInfoList) {
-                    if (finalSubtitles.length >= 4) break;
+                    if (transCandidates.length >= maxTransCandidates) break;
 
                     if (usedTransUrls.has(transSubInfo.url)) continue;
                     usedTransUrls.add(transSubInfo.url);
+                    
+                    // Track how many we've taken from this source
+                    const source = transSubInfo.source || 'Unknown';
+                    transSourceCounts[source] = (transSourceCounts[source] || 0);
+                    
+                    // Skip if we already have enough from this source (unless we haven't hit our total limit)
+                    if (transSourceCounts[source] >= maxTransPerSource && transCandidates.length >= maxTransPerSource) {
+                        continue;
+                    }
 
-                    const version = finalSubtitles.length + 1;
-                    console.log(`Processing translation candidate v${version} (ID: ${transSubInfo.id})...`);
+                    console.log(`Attempting to process translation candidate ${transCandidates.length + 1}: ID=${transSubInfo.id}, Source=${transSubInfo.source}, Downloads=${transSubInfo.downloads}`);
 
-                    // Use old API fetch if format is not SRT (indicates old API source)
-                    // Pass the actual language code from API response (not user's requested code)
-                    // This ensures proper encoding detection even when user requested an alias
+                    // Choose fetch method based on source
                     let transSubContent;
-                    if (transSubInfo.format && transSubInfo.format.toLowerCase() !== 'srt') {
+                    if (transSubInfo.source === 'SubDL') {
+                        // SubDL returns ZIP files
+                        transSubContent = await fetchSubtitleContentFromSubDL(transSubInfo.url, transSubInfo.lang);
+                    } else if (transSubInfo.format && transSubInfo.format.toLowerCase() !== 'srt') {
+                        // Old API with non-SRT format
                         transSubContent = await fetchSubtitleContentOldAPI(transSubInfo.url, transSubInfo.format, cookie, false, transSubInfo.lang);
                     } else {
+                        // Standard SRT fetch
                         transSubContent = await fetchSubtitleContent(transSubInfo.url, transSubInfo.format, transSubInfo.lang);
                     }
                     if (!transSubContent) {
-                        console.warn(`Failed to fetch content for translation v${version}. Skipping.`);
-                        continue; // Skip to next candidate
+                        console.warn(`Failed to fetch content for translation candidate. Skipping.`);
+                        continue;
                     }
 
                     // Parse content
                     const transParsed = parseSrt(transSubContent);
                     if (!transParsed) {
-                        console.warn(`Failed to parse content for translation v${version}. Skipping.`);
-                        continue; // Skip to next candidate
+                        console.warn(`Failed to parse content for translation candidate. Skipping.`);
+                        continue;
                     }
 
-                    // Merge with main
-                    console.log(`Merging main with translation v${version}...`);
-                    const mergedParsed = mergeSubtitles([...mainParsed], transParsed); // Use copy of mainParsed
-                    if (!mergedParsed || mergedParsed.length === 0) {
-                        console.warn(`Merging failed or resulted in empty subtitles for v${version}. Skipping.`);
-                        continue; // Skip to next candidate
-                    }
+                    // Success!
+                    transCandidates.push({
+                        parsed: transParsed,
+                        info: transSubInfo
+                    });
+                    transSourceCounts[source]++;
+                    console.log(`Successfully processed translation candidate ${transCandidates.length} (ID: ${transSubInfo.id}, Source: ${transSubInfo.source})`);
+                }
 
-                    // Format to SRT
-                    console.log(`Formatting merged SRT for v${version}...`);
-                    const mergedSrtString = formatSrt(mergedParsed);
-                    if (!mergedSrtString) {
-                        console.warn(`Failed to format merged SRT for v${version}. Skipping.`);
-                        continue; // Skip to next candidate
-                    }
+                if (transCandidates.length === 0) {
+                    console.error("Failed to fetch and parse any of the available translation subtitles. Cannot proceed.");
+                    return { subtitles: [], cacheMaxAge: 60 };
+                }
 
-                    // --- Conditional Upload Logic --- 
-                    let uploadedToVercel = false;
-                    let uploadUrl = null;
-                    let subtitleEntryId = `merged-${selectedMainSubInfo.id}-${transSubInfo.id}`; // Use the ID of the successfully fetched main sub
+                console.log(`Successfully processed ${transCandidates.length} translation subtitle candidates.`);
 
-                    // Attempt Vercel Blob upload ONLY if not skipped
-                    if (!skipVercelBlob) {
-                        console.log(`Attempting Vercel Blob upload for v${version}...`);
-                        try {
-                            const blobFileName = type === 'series' && season && episode 
-                                ? `${imdbId}_S${season}E${episode}_${mainLang}_${transLang}_v${version}.srt` 
-                                : `${imdbId}_${mainLang}_${transLang}_v${version}.srt`;
-                            const { url } = await put(
-                                blobFileName,
-                                mergedSrtString,
-                                { access: 'public', addRandomSuffix: true }
-                            );
-                            console.log(`Uploaded v${version} to Vercel Blob: ${url}`);
-                            uploadUrl = url;
-                            uploadedToVercel = true;
-                            subtitleEntryId += '-vercel'; 
-                        } catch (uploadError) {
-                            console.error(`Failed to upload merged SRT for v${version} to Vercel Blob: ${uploadError.message}`);
-                            // Do not throw, proceed to check Supabase fallback
+                // 4. Create all combinations of main + translation subtitles
+                const finalSubtitles = [];
+                let combinationIndex = 0;
+
+                console.log(`Creating all combinations: ${mainCandidates.length} main × ${transCandidates.length} translation = ${mainCandidates.length * transCandidates.length} total combinations`);
+
+                for (let i = 0; i < mainCandidates.length; i++) {
+                    const mainCandidate = mainCandidates[i];
+                    
+                    for (let j = 0; j < transCandidates.length; j++) {
+                        const transCandidate = transCandidates[j];
+                        
+                        combinationIndex++;
+                        const version = combinationIndex;
+                        
+                        console.log(`\n--- Processing Combination ${version} ---`);
+                        console.log(`Main: ${mainCandidate.info.source} (ID: ${mainCandidate.info.id})`);
+                        console.log(`Translation: ${transCandidate.info.source} (ID: ${transCandidate.info.id})`);
+
+                        // Merge with main
+                        console.log(`Merging main with translation for v${version}...`);
+                        const mergedParsed = mergeSubtitles([...mainCandidate.parsed], transCandidate.parsed);
+                        if (!mergedParsed || mergedParsed.length === 0) {
+                            console.warn(`Merging failed or resulted in empty subtitles for v${version}. Skipping.`);
+                            continue;
                         }
-                    }
 
-                    // Attempt Supabase upload if Vercel was skipped OR failed
-                    if (!uploadUrl && supabase) {
-                        console.log(`Attempting Supabase Storage upload for v${version}...`);
-                        try {
-                            const supabaseFileName = type === 'series' && season && episode
-                                ? `${imdbId}/S${season}E${episode}_${mainLang}_${transLang}_v${version}.srt`
-                                : `${imdbId}/${mainLang}_${transLang}_v${version}.srt`;
-                            const { error: supabaseError } = await supabase
-                                .storage
-                                .from('subtitles') // Replace 'subtitles' with your bucket name
-                                .upload(supabaseFileName, mergedSrtString, {
-                                    cacheControl: '3600',
-                                    upsert: true,
-                                    contentType: 'text/srt; charset=utf-8'
-                                });
+                        // Format to SRT
+                        console.log(`Formatting merged SRT for v${version}...`);
+                        const mergedSrtString = formatSrt(mergedParsed);
+                        if (!mergedSrtString) {
+                            console.warn(`Failed to format merged SRT for v${version}. Skipping.`);
+                            continue;
+                        }
 
-                            if (supabaseError) throw supabaseError;
+                        // --- Conditional Upload Logic --- 
+                        let uploadUrl = null;
+                        const sourceLabel = `${mainCandidate.info.source.substring(0, 3)}-${transCandidate.info.source.substring(0, 3)}`;
+                        let subtitleEntryId = `merged-${mainCandidate.info.id}-${transCandidate.info.id}`;
 
-                            const { data: publicUrlData } = supabase
-                                .storage
-                                .from('subtitles') // Replace 'subtitles' with your bucket name
-                                .getPublicUrl(supabaseFileName);
-
-                            if (!publicUrlData || !publicUrlData.publicUrl) {
-                                console.error(`Supabase upload successful for v${version}, but failed to get public URL.`);
-                            } else {
-                                uploadUrl = publicUrlData.publicUrl;
-                                console.log(`Uploaded v${version} to Supabase: ${uploadUrl}`);
-                                subtitleEntryId += '-supabase'; 
+                        // Attempt Vercel Blob upload ONLY if not skipped
+                        if (!skipVercelBlob) {
+                            console.log(`Attempting Vercel Blob upload for v${version}...`);
+                            try {
+                                const blobFileName = type === 'series' && season && episode 
+                                    ? `${imdbId}_S${season}E${episode}_${mainLang}_${transLang}_${sourceLabel}_v${version}.srt` 
+                                    : `${imdbId}_${mainLang}_${transLang}_${sourceLabel}_v${version}.srt`;
+                                const { url } = await put(
+                                    blobFileName,
+                                    mergedSrtString,
+                                    { access: 'public', addRandomSuffix: true }
+                                );
+                                console.log(`Uploaded v${version} to Vercel Blob: ${url}`);
+                                uploadUrl = url;
+                                subtitleEntryId += '-vercel'; 
+                            } catch (uploadError) {
+                                console.error(`Failed to upload merged SRT for v${version} to Vercel Blob: ${uploadError.message}`);
                             }
-                        } catch (supabaseUploadError) {
-                            console.error(`Supabase Storage upload failed for v${version}: ${supabaseUploadError.message}`);
-                             // Log error, don't add to final results if both failed
+                        }
+
+                        // Attempt Supabase upload if Vercel was skipped OR failed
+                        if (!uploadUrl && supabase) {
+                            console.log(`Attempting Supabase Storage upload for v${version}...`);
+                            try {
+                                const supabaseFileName = type === 'series' && season && episode
+                                    ? `${imdbId}/S${season}E${episode}_${mainLang}_${transLang}_${sourceLabel}_v${version}.srt`
+                                    : `${imdbId}/${mainLang}_${transLang}_${sourceLabel}_v${version}.srt`;
+                                const { error: supabaseError } = await supabase
+                                    .storage
+                                    .from('subtitles')
+                                    .upload(supabaseFileName, mergedSrtString, {
+                                        cacheControl: '3600',
+                                        upsert: true,
+                                        contentType: 'text/srt; charset=utf-8'
+                                    });
+
+                                if (supabaseError) throw supabaseError;
+
+                                const { data: publicUrlData } = supabase
+                                    .storage
+                                    .from('subtitles')
+                                    .getPublicUrl(supabaseFileName);
+
+                                if (!publicUrlData || !publicUrlData.publicUrl) {
+                                    console.error(`Supabase upload successful for v${version}, but failed to get public URL.`);
+                                } else {
+                                    uploadUrl = publicUrlData.publicUrl;
+                                    console.log(`Uploaded v${version} to Supabase: ${uploadUrl}`);
+                                    subtitleEntryId += '-supabase'; 
+                                }
+                            } catch (supabaseUploadError) {
+                                console.error(`Supabase Storage upload failed for v${version}: ${supabaseUploadError.message}`);
+                            }
+                        }
+
+                        // Attempt Local Storage if both Vercel and Supabase failed/skipped
+                        if (!uploadUrl && LOCAL_STORAGE_DIR) {
+                            console.log(`Attempting Local Storage upload for v${version}...`);
+                            try {
+                                await fs.mkdir(LOCAL_STORAGE_DIR, { recursive: true });
+
+                                const localFileName = type === 'series' && season && episode
+                                    ? `${imdbId}_S${season}E${episode}_${mainLang}_${transLang}_${sourceLabel}_v${version}.srt`
+                                    : `${imdbId}_${mainLang}_${transLang}_${sourceLabel}_v${version}.srt`;
+                                const localFilePath = path.join(LOCAL_STORAGE_DIR, localFileName);
+
+                                await fs.writeFile(localFilePath, mergedSrtString, 'utf-8');
+
+                                uploadUrl = `${EXTERNAL_URL}/subtitles/${localFileName}`;
+                                console.log(`Uploaded v${version} to Local Storage: ${uploadUrl}`);
+                                subtitleEntryId += '-local';
+                            } catch (localStorageError) {
+                                console.error(`Local Storage upload failed for v${version}: ${localStorageError.message}`);
+                            }
+                        }
+
+                        // Add to results if an upload was successful
+                        if (uploadUrl) {
+                            finalSubtitles.push({
+                                id: subtitleEntryId,
+                                url: uploadUrl,
+                                lang: `${mainLang}+${transLang} [${mainCandidate.info.source}+${transCandidate.info.source}]`
+                            });
+                            console.log(`✓ Successfully created combination v${version}`);
+                        } else {
+                            console.warn(`Failed to upload v${version} to any storage. Skipping.`);
                         }
                     }
-
-                    // Attempt Local Storage if both Vercel and Supabase failed/skipped
-                    if (!uploadUrl && LOCAL_STORAGE_DIR) {
-                        console.log(`Attempting Local Storage upload for v${version}...`);
-                        try {
-                            // Create the local storage directory if it doesn't exist
-                            await fs.mkdir(LOCAL_STORAGE_DIR, { recursive: true });
-
-                            const localFileName = type === 'series' && season && episode
-                                ? `${imdbId}_S${season}E${episode}_${mainLang}_${transLang}_v${version}.srt`
-                                : `${imdbId}_${mainLang}_${transLang}_v${version}.srt`;
-                            const localFilePath = path.join(LOCAL_STORAGE_DIR, localFileName);
-
-                            // Write the subtitle file to local storage
-                            await fs.writeFile(localFilePath, mergedSrtString, 'utf-8');
-
-                            // Generate URL using external URL (supports remote access)
-                            uploadUrl = `${EXTERNAL_URL}/subtitles/${localFileName}`;
-                            console.log(`Uploaded v${version} to Local Storage: ${uploadUrl}`);
-                            subtitleEntryId += '-local';
-                        } catch (localStorageError) {
-                            console.error(`Local Storage upload failed for v${version}: ${localStorageError.message}`);
-                        }
-                    }
-
-                    // Add to results if an upload was successful
-                    if (uploadUrl) {
-                         finalSubtitles.push({
-                             id: subtitleEntryId,
-                             url: uploadUrl,
-                             lang: `${mainLang}+${transLang}`
-                         });
-                    } else {
-                         console.warn(`Failed to upload v${version} to either Vercel Blob or Supabase Storage.`);
-                    }
-                    // --- End Conditional Upload Logic ---
                 }
 
                 // 5. Return results
                 if (finalSubtitles.length === 0) {
-                    console.warn("Processed translation candidates, but none resulted in a usable subtitle file. Returning empty.");
+                    console.warn("Processed subtitle combinations, but none resulted in a usable subtitle file. Returning empty.");
+                } else {
+                    console.log(`\n✅ Successfully created ${finalSubtitles.length} subtitle combination(s)!`);
+                    finalSubtitles.forEach((sub, idx) => {
+                        console.log(`  ${idx + 1}. ${sub.lang}`);
+                    });
                 }
 
                 return {

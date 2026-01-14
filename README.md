@@ -18,12 +18,14 @@ or visit the addon page here:
 [https://strelingo-addon.vercel.app](https://strelingo-addon.vercel.app).
 
 ## Providers
-* OpenSubtitles.
+* **OpenSubtitles** - Primary subtitle source (no API key required)
+* **SubDL** - Secondary subtitle source for additional options (optional, requires free API key from [subdl.com/api](https://subdl.com/api))
 * [Buta no subs Stremio addon](https://github.com/Pigamer37/buta-no-subs-stremio-addon) for better japanese subtitles (Implemented by @Pigamer37).
 
 ## Features
 
-*   Fetches subtitles from OpenSubtitles.
+*   **Multiple subtitle sources**: Fetches subtitles from OpenSubtitles and SubDL (optional) to maximize availability and quality.
+*   **36 subtitle variations**: Generates combinations from up to 6 main language candidates and 6 translation candidates for better sync options.
 *   Automatically detects the best available subtitles for two selected languages.
 *   Handles Gzip compressed subtitles.
 *   **Robust encoding detection:** Handles UTF-16 LE/BE (with BOM), double-encoded BOMs, legacy encodings (Windows-1251, ISO-8859-x), and repairs double-encoded UTF-8 text (Implemented by @ravisorg).
@@ -38,7 +40,7 @@ or visit the addon page here:
 
 *   [Node.js](https://nodejs.org/) (Version 14 or higher recommended)
 *   [npm](https://www.npmjs.com/) or [yarn](https://yarnpkg.com/)
-*   You will need either vercel blob key or supabase storage credentials. Because the addon creates a brand new srt everytime and it has to host somewhere. you can put those credentials in .env (You can techinally return the subtitle as base64 but i have found that it only works for stremio 4 version, it didnt worked in stremio 5 or mobile stremio)
+*   **(Optional) SubDL API Key** - For enhanced subtitle availability, get a free API key from [subdl.com/api](https://subdl.com/api) and add `SUBDL_API_KEY` to your `.env` file. If not provided, the addon will only use OpenSubtitles.
 *   **Storage Configuration** - You need to choose at least one storage option. Configure your choice via the `.env` file (see [`.env.example`](.env.example) for all options):
     *   **Option 1: Vercel Blob** (cloud) - Create a Vercel Blob in [Vercel Dashboard](https://vercel.com/dashboard/stores), copy the token, and put it in your `.env` as `BLOB_READ_WRITE_TOKEN`
     *   **Option 2: Supabase Storage** (cloud) - Get `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` from your [Supabase project settings](https://app.supabase.com) and add them to your `.env`
